@@ -1,0 +1,29 @@
+[workspace]
+authors = ["Uday Phalak <udayphlk@gmail.com>"]
+channels = ["pytorch", "conda-forge"]
+name = "continuous-thought-machines"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+[dependencies]
+python = "3.12.*"
+pytorch = "*"
+torchvision = "*"
+numpy = "*"
+matplotlib = "*"
+seaborn = "*"
+tqdm = "*"
+opencv = "*"
+imageio = "*"
+scikit-learn = "*"
+umap-learn = "*"
+python-dotenv = "*"
+gymnasium = "*"
+datasets = "*"
+huggingface_hub = "*"
+safetensors = "*"
+ffmpeg = "*"
+
+[pypi-dependencies]
+autoclip = "*"
+minigrid = "*"
