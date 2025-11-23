@@ -1,0 +1,60 @@
+# Energy Halting Experiment Config
+
+# Model Architecture
+model: ctm
+d_model: 512
+d_input: 128
+heads: 4
+iterations: 50
+dropout: 0.0
+backbone_type: resnet18-4
+positional_embedding_type: none
+
+# CTM Specifics
+synapse_depth: 4
+n_synch_out: 512
+n_synch_action: 512
+neuron_select_type: random-pairing
+n_random_pairing_self: 0
+memory_length: 25
+deep_memory: true
+memory_hidden_dims: 4
+do_normalisation: false
+
+# Energy Head
+energy_head:
+  enabled: true
+  d_hidden: 64
+
+# Training
+batch_size: 32
+batch_size_test: 32
+lr: 1.0e-3
+training_iterations: 100001
+warmup_steps: 5000
+use_scheduler: true
+scheduler_type: cosine
+weight_decay: 0.0
+gradient_clipping: -1
+do_compile: false
+num_workers_train: 4
+
+# Loss
+loss:
+  type: energy_contrastive
+  margin: 5.0
+  energy_scale: 0.5
+
+# Inference
+inference:
+  energy_threshold: 0.5
+  delta_threshold: 0.01
+
+# Housekeeping
+dataset: cifar10
+data_root: data/
+save_every: 1000
+track_every: 1000
+seed: 412
+log_dir: logs/energy_experiment
+device: [-1] # Auto-detect

@@ -169,6 +169,57 @@ def parity_loss(predictions, certainties, targets, use_most_certain=True):
     return loss, loss_index_2
 
 
+class EnergyContrastiveLoss(nn.Module):
+    def __init__(self, margin=10.0, energy_scale=0.1):
+        super().__init__()
+        self.margin = margin
+        self.energy_scale = energy_scale
+        self.ce_loss = nn.CrossEntropyLoss(reduction='none')
+
+    def forward(self, logits_history, energy_history, targets):
+        """
+        logits_history: [B, Class, T]
+        energy_history: [B, 1, T]
+        targets: [B]
+        """
+        B, C, T = logits_history.shape
+        
+        # Flatten for easy computation
+        logits_flat = logits_history.permute(0, 2, 1).reshape(B * T, C)
+        energy_flat = energy_history.permute(0, 2, 1).reshape(B * T)
+        targets_expanded = targets.unsqueeze(1).repeat(1, T).reshape(B * T)
+
+        # 1. Standard Classification Loss (Cross Entropy)
+        ce_vals = self.ce_loss(logits_flat, targets_expanded)
+        
+        # 2. Determine "Correctness" for Contrastive Divergence
+        # We treat a step as "positive" if the prediction matches the target
+        predictions = logits_flat.argmax(dim=1)
+        is_correct = (predictions == targets_expanded).float() # 1.0 if correct, 0.0 if wrong
+
+        # 3. Energy Loss Logic
+        # If Correct: Minimize Energy (Pull down to 0)
+        # If Incorrect: Maximize Energy (Push up to margin)
+        
+        # L_pos = ||E(x)||^2  (Push correct states to 0 energy)
+        loss_pos = energy_flat ** 2
+        
+        # L_neg = max(0, m - E(x))^2 (Push incorrect states above margin m)
+        loss_neg = F.relu(self.margin - energy_flat) ** 2
+
+        # Combine: correct samples use loss_pos, incorrect use loss_neg
+        energy_objective = (is_correct * loss_pos) + ((1 - is_correct) * loss_neg)
+        
+        # Total Loss
+        total_loss = ce_vals.mean() + (self.energy_scale * energy_objective.mean())
+        
+        return total_loss, {
+            "ce_loss": ce_vals.mean().item(), 
+            "energy_loss": energy_objective.mean().item(),
+            "avg_energy": energy_flat.mean().item()
+        }
+
+
 def qamnist_loss(predictions, certainties, targets, use_most_certain=True):
     """
     Computes the qamnist loss over the last num_answer_steps steps.

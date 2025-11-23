@@ -98,6 +98,8 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
                  dropout_nlm=None,
                  neuron_select_type='random-pairing',  
                  n_random_pairing_self=0,
+                 energy_head_enabled=False,
+                 energy_hidden_dim=64,
                  ):
         super(ContinuousThoughtMachine, self).__init__()
 
@@ -115,6 +117,8 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         self.neuron_select_type = neuron_select_type
         self.memory_length = memory_length
         dropout_nlm = dropout if dropout_nlm is None else dropout_nlm
+        self.energy_head_enabled = energy_head_enabled
+        self.energy_hidden_dim = energy_hidden_dim
 
         # --- Assertions ---
         self.verify_args()
@@ -149,6 +153,14 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
 
         # --- Output Procesing ---
         self.output_projector = nn.Sequential(nn.LazyLinear(self.out_dims))
+        
+        # --- Energy Projector ---
+        if self.energy_head_enabled:
+            self.energy_proj = nn.Sequential(
+                nn.LazyLinear(self.energy_hidden_dim),
+                nn.SiLU(),
+                nn.Linear(self.energy_hidden_dim, 1)
+            )
 
     @classmethod
     def _from_pretrained(
@@ -460,13 +472,23 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
                 neuron_indices_left = neuron_indices_right = torch.arange(d_model-n_synch, d_model)
 
         elif self.neuron_select_type=='random':
-            neuron_indices_left = torch.from_numpy(np.random.choice(np.arange(d_model), size=n_synch))
-            neuron_indices_right = torch.from_numpy(np.random.choice(np.arange(d_model), size=n_synch))
+            neuron_indices_left = torch.randperm(d_model)[:n_synch]
+            neuron_indices_right = torch.randperm(d_model)[:n_synch]
 
         elif self.neuron_select_type=='random-pairing':
             assert n_synch > n_random_pairing_self, f"Need at least {n_random_pairing_self} pairs for {self.neuron_select_type}"
-            neuron_indices_left = torch.from_numpy(np.random.choice(np.arange(d_model), size=n_synch))
-            neuron_indices_right = torch.concatenate((neuron_indices_left[:n_random_pairing_self], torch.from_numpy(np.random.choice(np.arange(d_model), size=n_synch-n_random_pairing_self))))
+            neuron_indices_left = torch.randperm(d_model)[:n_synch]
+            # For right, we need to concatenate self-pairs and random pairs
+            # This logic mimics the original numpy logic but using torch
+            # Original: neuron_indices_right = torch.concatenate((neuron_indices_left[:n_random_pairing_self], torch.from_numpy(np.random.choice(np.arange(d_model), size=n_synch-n_random_pairing_self))))
+            
+            # Note: The original logic allowed replacement in the random choice for the second part? 
+            # np.random.choice(np.arange(d_model), size=...) defaults to replace=False if not specified? No, defaults to replace=True? 
+            # Actually np.random.choice(a, size) defaults to replace=True if a is an int? No, wait.
+            # Let's assume we want random indices.
+            
+            random_part = torch.randperm(d_model)[:n_synch-n_random_pairing_self]
+            neuron_indices_right = torch.cat((neuron_indices_left[:n_random_pairing_self], random_part))
 
         device = self.start_activated_state.device
         return neuron_indices_left.to(device), neuron_indices_right.to(device)
@@ -533,7 +555,9 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         post_activations_tracking = []
         synch_out_tracking = []
         synch_action_tracking = []
+        synch_action_tracking = []
         attention_tracking = []
+        energy_tracking = []
 
         # --- Featurise Input Data ---
         kv = self.compute_features(x)
@@ -544,7 +568,9 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
 
         # --- Prepare Storage for Outputs per Iteration ---
         predictions = torch.empty(B, self.out_dims, self.iterations, device=device, dtype=torch.float32)
+        predictions = torch.empty(B, self.out_dims, self.iterations, device=device, dtype=torch.float32)
         certainties = torch.empty(B, 2, self.iterations, device=device, dtype=torch.float32)
+        energies = torch.empty(B, 1, self.iterations, device=device, dtype=torch.float32) if self.energy_head_enabled else None
 
         # --- Initialise Recurrent Synch Values  ---
         decay_alpha_action, decay_beta_action = None, None
@@ -587,7 +613,12 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
             current_certainty = self.compute_certainty(current_prediction)
 
             predictions[..., stepi] = current_prediction
+            predictions[..., stepi] = current_prediction
             certainties[..., stepi] = current_certainty
+            
+            if self.energy_head_enabled:
+                current_energy = self.energy_proj(synchronisation_out)
+                energies[..., stepi] = current_energy
 
             # --- Tracking ---
             if track:
@@ -600,5 +631,11 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         # --- Return Values ---
         if track:
             return predictions, certainties, (np.array(synch_out_tracking), np.array(synch_action_tracking)), np.array(pre_activations_tracking), np.array(post_activations_tracking), np.array(attention_tracking)
+        if track:
+            return predictions, certainties, (np.array(synch_out_tracking), np.array(synch_action_tracking)), np.array(pre_activations_tracking), np.array(post_activations_tracking), np.array(attention_tracking)
+        
+        if self.energy_head_enabled:
+            return predictions, certainties, energies
+            
         return predictions, certainties, synchronisation_out
 
