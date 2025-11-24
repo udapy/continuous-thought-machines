@@ -1,141 +1,237 @@
+---
+title: Continuous Thought Machine
+emoji: 🕰️
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+sdk_version: "20.10.21"
+app_file: app.py
+pinned: false
+---
+
+Check out the configuration reference at https://huggingface.co/docs/hub/spaces-config-reference
+
 # 🕰️ The Continuous Thought Machine
 
 📚 [PAPER: Technical Report](https://arxiv.org/abs/2505.05522) | 📝 [Blog](https://sakana.ai/ctm/) | 🕹️ [Interactive Website](https://pub.sakana.ai/ctm) | ✏️ [Tutorial](examples/01_mnist.ipynb)
 
-![Activations](assets/activations.gif)
+## Overview
 
-We present the Continuous Thought Machine (CTM), a model designed to unfold and then leverage neural activity as the underlying mechanism for observation and action. Our contributions are:
+The **Continuous Thought Machine (CTM)** is a novel neural architecture designed to unfold and leverage neural activity as the underlying mechanism for observation and action. By introducing an internal temporal axis decoupled from input data, CTM enables neurons to process information over time with fine-grained temporal dynamics.
 
-1. An internal temporal axis, decoupled from any input data, that enables neuron activity to unfold.
+### Key Contributions
 
-2. Neuron-level temporal processing, where each neuron uses unique weight parameters to process a history of incoming signals, enabling fine-grained temporal dynamics.
+1. **Internal Temporal Axis**: Decoupled from input data, allowing neuron activity to unfold independently
+2. **Neuron-Level Temporal Processing**: Each neuron uses unique weight parameters to process a history of incoming signals
+3. **Neural Synchronisation**: Direct latent representation for modulating data and producing outputs, encoding information in the timing of neural activity
 
-3. Neural synchronisation, employed as a direct latent representation for modulating data and producing outputs, thus directly encoding information in the timing of neural activity.
+The CTM demonstrates strong performance across diverse tasks including ImageNet classification, 2D maze solving, sorting, parity computation, question-answering, and reinforcement learning.
 
-We demonstrate the CTM's strong performance and versatility across a range of challenging tasks, including ImageNet classification, solving 2D mazes, sorting, parity computation, question-answering, and RL tasks.
+---
 
-We provide all necessary code to reproduce our results and invite others to build upon and use CTMs in their own work.
+## 🔬 Energy-Based Halting Experiment
 
-## [Interactive Website](https://pub.sakana.ai/ctm)
-Please see our [Interactive Website](https://pub.sakana.ai/ctm) for a maze-solving demo, many demonstrative videos of the method, results, and other findings. 
+This repository includes an implementation of **Energy-Based Halting**, a mechanism that frames "thinking" as an optimization process where the model dynamically adjusts its internal thought process duration based on sample difficulty.
 
+### Concept
 
-## Repo structure
-```
-├── tasks
-│   ├── image_classification
-│   │   ├── train.py                          # Training code for image classification (cifar, imagenet)
-│   │   ├── imagenet_classes.py               # Helper for imagenet class names
-│   │   ├── plotting.py                       # Plotting utils specific to this task
-│   │   └── analysis
-│   │       ├──run_imagenet_analysis.py       # ImageNet eval and visualisation code
-│   │       └──outputs/                       # Folder for outputs of analysis
-│   ├── mazes
-│   │   ├── train.py                          # Training code for solving 2D mazes (by way of a route; see paper)
-│   │   └── plotting.py                       # Plotting utils specific to this task
-│   │   └── analysis
-│   │       ├──run.py                         # Maze analysis code
-│   │       └──outputs/                       # Folder for outputs of analysis
-│   ├── sort
-│   │   ├── train.py                          # Training code for sorting
-│   │   └── utils.py                          # Sort specific utils (e.g., CTC decode)
-│   ├── parity
-│   │   ├── train.py                          # Training code for parity task
-│   │   ├── utils.py                          # Parity-specific helper functions
-│   │   ├── plotting.py                       # Plotting utils specific to this task
-│   │   ├── scripts/
-│   │   │   └── *.sh                          # Training scripts for different experimental setups
-│   │   └── analysis/
-│   │       └── run.py                        # Entry point for parity analysis
-│   ├── qamnist
-│   │   ├── train.py                          # Training code for QAMNIST task (quantized MNIST)
-│   │   ├── utils.py                          # QAMNIST-specific helper functions
-│   │   ├── plotting.py                       # Plotting utils specific to this task
-│   │   ├── scripts/
-│   │   │   └── *.sh                          # Training scripts for different experimental setups
-│   │   └── analysis/
-│   │       └── run.py                        # Entry point for QAMNIST analysis
-│   └── rl
-│       ├── train.py                          # Training code for RL environments
-│       ├── utils.py                          # RL-specific helper functions
-│       ├── plotting.py                       # Plotting utils specific to this task
-│       ├── envs.py                           # Custom RL environment wrappers
-│       ├── scripts/
-│       │   ├── 4rooms/
-│       │   │   └── *.sh                      # Training scripts for MiniGrid-FourRooms-v0 environment
-│       │   ├── acrobot/
-│       │   │   └── *.sh                      # Training scripts for Acrobot-v1 environment
-│       │   └── cartpole/
-│       │       └── *.sh                      # Training scripts for CartPole-v1 environment
-│       └── analysis/
-│           └── run.py                        # Entry point for RL analysis
-├── data                                      # This is where data will be saved and downloaded to
-│   └── custom_datasets.py                    # Custom datasets (e.g., Mazes), sort
-├── models
-│   ├── ctm.py                                # Main model code, used for: image classification, solving mazes, sort
-│   ├── ctm_*.py                              # Other model code, standalone adjustments for other tasks
-│   ├── ff.py                                 # feed-forward (simple) baseline code (e.g., for image classification)
-│   ├── lstm.py                               # LSTM baseline code (e.g., for image classification)
-│   ├── lstm_*.py                              # Other baseline code, standalone adjustments for other tasks
-│   ├── modules.py                            # Helper modules, including Neuron-level models and the Synapse UNET
-│   ├── utils.py                              # Helper functions (e.g., synch decay)
-│   └── resnet.py                             # Wrapper for ResNet featuriser
-├── utils
-│   ├── housekeeping.py                       # Helper functions for keeping things neat
-│   ├── losses.py                             # Loss functions for various tasks (mostly with reshaping stuff)
-│   └── schedulers.py                         # Helper wrappers for learning rate schedulers
-└── checkpoints
-    └── imagenet, mazes, ...                  # Checkpoint directories (see google drive link for files)
+Instead of using heuristic certainty thresholds, we train a learned energy scalar that:
 
+- **Minimizes energy** for correct predictions (pushing the system to low-energy equilibrium)
+- **Maximizes energy** for incorrect predictions (pushing away from stable states)
+- **Enables adaptive halting** based on energy thresholds or convergence
+
+### Implementation
+
+**Modified Components:**
+
+- `models/ctm.py`: Added energy projection head that maps synchronization states to scalar energy values
+- `utils/losses.py`: Implemented `EnergyContrastiveLoss` for training the energy function
+- `tasks/image_classification/train_energy.py`: Training script with energy halting
+- `inference_energy.py`: Adaptive inference that halts when energy drops below threshold or stabilizes
+- `configs/energy_experiment.yaml`: Configuration for energy experiments
+
+**Training:**
+
+```bash
+# Local training
+pixi run accelerate launch tasks/image_classification/train_energy.py \
+    --energy_head_enabled \
+    --loss_type energy_contrastive \
+    --dataset cifar10
+
+# Or with traditional python
+pixi run python tasks/image_classification/train_energy.py \
+    --energy_head_enabled \
+    --loss_type energy_contrastive
 ```
 
-## Setup
-To set up the environment using conda:
+**Deployment to Hugging Face:**
+See [GUIDE_HF.md](GUIDE_HF.md) for instructions on deploying the training job to Hugging Face Spaces with GPU support.
 
+---
+
+## 🚀 Quick Start
+
+### Setup with Pixi (Recommended)
+
+We use [Pixi](https://pixi.sh) for dependency management, which handles both Python packages and system dependencies like `ffmpeg`.
+
+```bash
+# Install dependencies
+pixi install
+
+# Run training
+pixi run python tasks/image_classification/train.py
 ```
+
+### Alternative: Conda Setup
+
+```bash
 conda create --name=ctm python=3.12
 conda activate ctm
 pip install -r requirements.txt
+conda install -c conda-forge ffmpeg
 ```
 
-If there are issues with PyTorch versions, the following can be ran:
-```
+If there are PyTorch version issues:
+
+```bash
 pip uninstall torch
 pip install torch --index-url https://download.pytorch.org/whl/cu121
 ```
 
-## Model training
-Each task has its own (set of) training code. See for instance [tasks/image_classification/train.py](tasks/image_classification/train.py). We have set it up like this to ensure ease-of-use as opposed to clinical efficiency. This code is for researchers and we hope to have it shared in a way that fosters collaboration and learning. 
+---
 
-While we have provided reasonable defaults in the argparsers of each training setup, scripts to replicate the setups in the paper will typically be found in the accompanying script folders. If you simply want to dive in, run the following as a module (setup like this to make it easy to run many high-level training scripts from the top directory):
+## 📁 Repository Structure
 
 ```
+├── tasks/
+│   ├── image_classification/
+│   │   ├── train.py                    # Standard training
+│   │   ├── train_energy.py             # Energy halting training
+│   │   ├── analysis/run_imagenet_analysis.py
+│   │   └── plotting.py
+│   ├── mazes/
+│   │   ├── train.py
+│   │   └── analysis/
+│   ├── sort/
+│   ├── parity/
+│   ├── qamnist/
+│   └── rl/
+├── models/
+│   ├── ctm.py                          # Main CTM model (with energy head support)
+│   ├── modules.py                      # Neuron-level models, Synapse UNET
+│   ├── ff.py                           # Feed-forward baseline
+│   └── lstm.py                         # LSTM baseline
+├── utils/
+│   ├── losses.py                       # Loss functions (includes EnergyContrastiveLoss)
+│   ├── schedulers.py
+│   └── housekeeping.py
+├── data/
+│   └── custom_datasets.py
+├── configs/
+│   └── energy_experiment.yaml          # Energy halting hyperparameters
+├── inference_energy.py                 # Adaptive energy-based inference
+├── Dockerfile                          # For HF Spaces deployment
+├── GUIDE_HF.md                         # Hugging Face deployment guide
+└── checkpoints/                        # Model checkpoints
+```
+
+---
+
+## 🎯 Model Training
+
+Each task has dedicated training code designed for ease-of-use and collaboration. Training scripts include reasonable defaults, with paper-replicating configurations in accompanying script folders.
+
+### Image Classification Example
+
+```bash
+# Standard CTM training
 python -m tasks.image_classification.train
+
+# Energy halting training
+python -m tasks.image_classification.train_energy \
+    --energy_head_enabled \
+    --loss_type energy_contrastive
 ```
-For debugging in VSCode, this configuration example might be helpful to you:
-```
+
+### VSCode Debug Configuration
+
+```json
 {
-    "name": "Debug: train image classifier",
-    "type": "debugpy",
-    "request": "launch",
-    "module": "tasks.image_classification.train",
-    "console": "integratedTerminal",
-    "justMyCode": false
+  "name": "Debug: train image classifier",
+  "type": "debugpy",
+  "request": "launch",
+  "module": "tasks.image_classification.train",
+  "console": "integratedTerminal",
+  "justMyCode": false
 }
 ```
 
+---
 
-## Running analyses
+## 🔍 Analysis & Visualization
 
-We also provide analysis and plotting code to replicate many of the plots in our paper. See `tasks/.../analysis/*` for more details on that. We also provide some data (e.g., the mazes we generated for training) and checkpoints (see [here](#checkpoints-and-data)). Note that ffmpeg is required for generating mp4 files from the analysis scripts. It can be installed with:
-```
+Analysis and plotting code to replicate paper figures is provided in `tasks/.../analysis/*`.
+
+**Note:** `ffmpeg` is required for generating videos:
+
+```bash
 conda install -c conda-forge ffmpeg
+# or with pixi (already included)
+pixi install
 ```
 
+---
 
-## Checkpoints and data
-You can download the data and checkpoints from here: 
-- checkpoints: https://drive.google.com/drive/folders/1vSg8T7FqP-guMDk1LU7_jZaQtXFP9sZg
-- maze data: https://drive.google.com/file/d/1cBgqhaUUtsrll8-o2VY42hPpyBcfFv86/view?usp=drivesdk
+## 📦 Checkpoints and Data
 
-Checkpoints go in the `checkpoints` folder. For instance, when properly populated, the checkpoints folder will have the maze checkpoint in `checkpoints/mazes/...`
+Download pre-trained checkpoints and datasets:
+
+- **Checkpoints**: [Google Drive](https://drive.google.com/drive/folders/1vSg8T7FqP-guMDk1LU7_jZaQtXFP9sZg)
+- **Maze Data**: [Google Drive](https://drive.google.com/file/d/1cBgqhaUUtsrll8-o2VY42hPpyBcfFv86/view?usp=drivesdk)
+
+Place checkpoints in the `checkpoints/` folder following the structure `checkpoints/{task}/...`
+
+---
+
+## 🤗 Hugging Face Integration
+
+This repository includes full support for training on Hugging Face infrastructure:
+
+- **Accelerate**: Multi-GPU and mixed precision training
+- **Hub Integration**: Automatic checkpoint uploading
+- **Spaces Deployment**: Run training jobs on GPU Spaces
+
+See [GUIDE_HF.md](GUIDE_HF.md) for detailed instructions.
+
+---
+
+## 📖 Interactive Resources
+
+- **[Interactive Website](https://pub.sakana.ai/ctm)**: Maze-solving demo, videos, and visualizations
+- **[Paper](https://arxiv.org/abs/2505.05522)**: Technical details and experiments
+- **[Blog](https://sakana.ai/ctm/)**: High-level overview and insights
+- **[Tutorial Notebook](examples/01_mnist.ipynb)**: Hands-on introduction
+
+---
+
+## 🙏 Citation
+
+If you use this code or build upon CTM in your work, please cite:
+
+```bibtex
+@article{ctm2025,
+  title={The Continuous Thought Machine},
+  author={...},
+  journal={arXiv preprint arXiv:2505.05522},
+  year={2025}
+}
+```
+
+---
+
+## 📝 License
+
+This project is released under the MIT License. See LICENSE file for details.
