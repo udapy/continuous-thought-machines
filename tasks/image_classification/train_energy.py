@@ -33,6 +33,9 @@ from utils.housekeeping import set_seed, zip_python_code
 from utils.losses import image_classification_loss, EnergyContrastiveLoss # Used by CTM, LSTM
 from utils.schedulers import WarmupCosineAnnealingLR, WarmupMultiStepLR, warmup
 
+from accelerate import Accelerator
+from huggingface_hub import upload_folder
+
 from autoclip.torch import QuantileClip
 
 import gc
@@ -127,14 +130,20 @@ def parse_args():
     parser.add_argument('--data_root', type=str, default='data/', help='Where to save dataset.')
     parser.add_argument('--save_every', type=int, default=1000, help='Save checkpoints every this many iterations.')
     parser.add_argument('--seed', type=int, default=412, help='Random seed.')
-    parser.add_argument('--reload', action=argparse.BooleanOptionalAction, default=False, help='Reload from disk?')
     parser.add_argument('--reload_model_only', action=argparse.BooleanOptionalAction, default=False, help='Reload only the model from disk?')
     parser.add_argument('--strict_reload', action=argparse.BooleanOptionalAction, default=True, help='Should use strict reload for model weights.') # Added back
     parser.add_argument('--track_every', type=int, default=1000, help='Track metrics every this many iterations.')
     parser.add_argument('--n_test_batches', type=int, default=20, help='How many minibatches to approx metrics. Set to -1 for full eval')
     parser.add_argument('--device', type=int, nargs='+', default=[-1], help='List of GPU(s) to use. Set to -1 to use CPU.')
     parser.add_argument('--use_amp', action=argparse.BooleanOptionalAction, default=False, help='AMP autocast.')
-
+    parser.add_argument('--reload', type=str, default=None, help='Path to checkpoint to reload from.')
+    parser.add_argument('--wandb', action=argparse.BooleanOptionalAction, default=False, help='Log to WandB.')
+    
+    # HF Hub
+    parser.add_argument('--push_to_hub', action=argparse.BooleanOptionalAction, default=False, help='Push model to HF Hub.')
+    parser.add_argument('--hub_model_id', type=str, default=None, help='HF Hub model ID (e.g., username/repo).')
+    parser.add_argument('--hub_token', type=str, default=None, help='HF Hub token.')
+    parser.add_argument('--hub_private', action=argparse.BooleanOptionalAction, default=False, help='Make HF Hub repo private.')
 
     args = parser.parse_args()
     return args
@@ -208,8 +217,23 @@ if __name__=='__main__':
     # Hosuekeeping
     args = parse_args()
 
-    set_seed(args.seed, False)
-    if not os.path.exists(args.log_dir): os.makedirs(args.log_dir)
+    set_seed(args.seed)
+    
+    # Initialize Accelerator
+    accelerator = Accelerator(log_with="wandb" if args.wandb else None)
+    device = accelerator.device
+    
+    # Setup Logging
+    if accelerator.is_main_process:
+        if not os.path.exists(args.log_dir):
+            os.makedirs(args.log_dir)
+        print(f"Logging to {args.log_dir}")
+        if args.wandb:
+             accelerator.init_trackers(
+                 project_name="continuous-thought-machines", 
+                 config=vars(args),
+                 init_kwargs={"wandb": {"name": args.log_dir.split('/')[-1]}}
+             )
 
     assert args.dataset in ['cifar10', 'cifar100', 'imagenet']
 
@@ -229,12 +253,6 @@ if __name__=='__main__':
         print(args, file=f)
 
     # Configure device string (support MPS on macOS)
-    if args.device[0] != -1:
-        device = f'cuda:{args.device[0]}'
-    elif torch.backends.mps.is_available():
-        device = 'mps'
-    else:
-        device = 'cpu'
     print(f'Running model {args.model} on {device}')
 
     # Build model conditionally
@@ -265,34 +283,31 @@ if __name__=='__main__':
         ).to(device)
     elif args.model == 'lstm':
          model = LSTMBaseline(
-            num_layers=args.num_layers,
-            iterations=args.iterations,
-            d_model=args.d_model,
+            d_model=args.d_model, 
             d_input=args.d_input,
-            heads=args.heads,
-            backbone_type=args.backbone_type,
-            positional_embedding_type=args.positional_embedding_type,
+            num_layers=args.num_layers,
             out_dims=args.out_dims,
-            prediction_reshaper=prediction_reshaper,
             dropout=args.dropout,
-        ).to(device)
+        )
     elif args.model == 'ff':
         model = FFBaseline(
-            d_model=args.d_model,
-            backbone_type=args.backbone_type,
+            d_model=args.d_model, 
+            d_input=args.d_input,
             out_dims=args.out_dims,
             dropout=args.dropout,
-        ).to(device)
+        )
     else:
-        raise ValueError(f"Unknown model type: {args.model}")
+        raise NotImplementedError
+    
+    model.train()
+
+    
+    # Param counting moved after initialization
 
 
     # For lazy modules so that we can get param count
     pseudo_inputs = train_data.__getitem__(0)[0].unsqueeze(0).to(device)
     model(pseudo_inputs) 
-
-    model.train()
-
     
     print(f'Total params: {sum(p.numel() for p in model.parameters())}')
     decay_params = []
@@ -332,6 +347,11 @@ if __name__=='__main__':
         else:
             raise NotImplementedError
 
+    # Prepare with Accelerator
+    # Note: Accelerate handles device placement
+    model, optimizer, trainloader, testloader, scheduler = accelerator.prepare(
+        model, optimizer, trainloader, testloader, scheduler
+    )
 
     # Metrics tracking
     start_iter = 0
@@ -344,9 +364,13 @@ if __name__=='__main__':
     train_accuracies_most_certain = [] if args.model in ['ctm', 'lstm'] else None
     test_accuracies_most_certain = [] if args.model in ['ctm', 'lstm'] else None
 
+    train_accuracies_most_certain = [] if args.model in ['ctm', 'lstm'] else None
+    test_accuracies_most_certain = [] if args.model in ['ctm', 'lstm'] else None
+
     # scaler = torch.amp.GradScaler("cuda" if "cuda" in device else "cpu", enabled=args.use_amp)
     # Fallback for older torch versions or specific builds
-    scaler = torch.cuda.amp.GradScaler(enabled=args.use_amp)
+    # scaler = torch.cuda.amp.GradScaler(enabled=args.use_amp)
+    # Accelerate handles mixed precision automatically
 
     # Reloading logic
     if args.reload:
@@ -355,14 +379,14 @@ if __name__=='__main__':
             print(f'Reloading from: {checkpoint_path}')
             checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
             if not args.strict_reload: print('WARNING: not using strict reload for model weights!')
-            load_result = model.load_state_dict(checkpoint['model_state_dict'], strict=args.strict_reload)
+            load_result = accelerator.unwrap_model(model).load_state_dict(checkpoint['model_state_dict'], strict=args.strict_reload)
             print(f" Loaded state_dict. Missing: {load_result.missing_keys}, Unexpected: {load_result.unexpected_keys}")
 
             if not args.reload_model_only:
                 print('Reloading optimizer etc.')
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-                scaler.load_state_dict(checkpoint['scaler_state_dict'])
+                # scaler.load_state_dict(checkpoint['scaler_state_dict']) # Scaler is handled by accelerator
                 start_iter = checkpoint['iteration']
                 # Load common metrics
                 train_losses = checkpoint['train_losses']
@@ -414,59 +438,58 @@ if __name__=='__main__':
                 iterator = iter(trainloader)
                 inputs, targets = next(iterator)
 
-            inputs = inputs.to(device)
-            targets = targets.to(device)
+            # inputs = inputs.to(device) # Handled by accelerator.prepare
+            # targets = targets.to(device) # Handled by accelerator.prepare
 
             loss = None
             accuracy = None
             # Model-specific forward and loss calculation
-            with torch.autocast(device_type="cuda" if "cuda" in device else "cpu", dtype=torch.float16, enabled=args.use_amp):
-                if args.do_compile: # CUDAGraph marking for clean compile
-                     torch.compiler.cudagraph_mark_step_begin()
+            # with torch.autocast(device_type="cuda" if "cuda" in device else "cpu", dtype=torch.float16, enabled=args.use_amp): # Handled by accelerator
+            if args.do_compile: # CUDAGraph marking for clean compile
+                    torch.compiler.cudagraph_mark_step_begin()
 
-                if args.model == 'ctm':
-                    if args.energy_head_enabled:
-                        predictions, certainties, energies = model(inputs)
-                        if args.loss_type == 'energy_contrastive':
-                            criterion = EnergyContrastiveLoss(margin=args.energy_margin, energy_scale=args.energy_scale)
-                            loss, stats = criterion(predictions, energies, targets)
-                            # Use standard accuracy metric for now
-                            where_most_certain = certainties[:,1].argmax(-1)
-                            accuracy = (predictions.argmax(1)[torch.arange(predictions.size(0), device=predictions.device),where_most_certain] == targets).float().mean().item()
-                            pbar_desc = f'CTM Loss={loss.item():0.3f}. Acc={accuracy:0.3f}. LR={current_lr:0.6f}. Avg Energy={stats["avg_energy"]:0.3f}'
-                        else:
-                             # Fallback to standard loss even if energy head is enabled (but unused)
-                             loss, where_most_certain = image_classification_loss(predictions, certainties, targets, use_most_certain=True)
-                             accuracy = (predictions.argmax(1)[torch.arange(predictions.size(0), device=predictions.device),where_most_certain] == targets).float().mean().item()
-                             pbar_desc = f'CTM Loss={loss.item():0.3f}. Acc={accuracy:0.3f}. LR={current_lr:0.6f}'
-                    else:
-                        predictions, certainties, synchronisation = model(inputs)
-                        loss, where_most_certain = image_classification_loss(predictions, certainties, targets, use_most_certain=True)
+            if args.model == 'ctm':
+                if args.energy_head_enabled:
+                    predictions, certainties, energies = model(inputs)
+                    if args.loss_type == 'energy_contrastive':
+                        criterion = EnergyContrastiveLoss(margin=args.energy_margin, energy_scale=args.energy_scale)
+                        loss, stats = criterion(predictions, energies, targets)
+                        # Use standard accuracy metric for now
+                        where_most_certain = certainties[:,1].argmax(-1)
                         accuracy = (predictions.argmax(1)[torch.arange(predictions.size(0), device=predictions.device),where_most_certain] == targets).float().mean().item()
-                        pbar_desc = f'CTM Loss={loss.item():0.3f}. Acc={accuracy:0.3f}. LR={current_lr:0.6f}. Where_certain={where_most_certain.float().mean().item():0.2f}+-{where_most_certain.float().std().item():0.2f} ({where_most_certain.min().item():d}<->{where_most_certain.max().item():d})'
-
-                elif args.model == 'lstm':
+                        pbar_desc = f'CTM Loss={loss.item():0.3f}. Acc={accuracy:0.3f}. LR={current_lr:0.6f}. Avg Energy={stats["avg_energy"]:0.3f}'
+                    else:
+                            # Fallback to standard loss even if energy head is enabled (but unused)
+                            loss, where_most_certain = image_classification_loss(predictions, certainties, targets, use_most_certain=True)
+                            accuracy = (predictions.argmax(1)[torch.arange(predictions.size(0), device=predictions.device),where_most_certain] == targets).float().mean().item()
+                            pbar_desc = f'CTM Loss={loss.item():0.3f}. Acc={accuracy:0.3f}. LR={current_lr:0.6f}'
+                else:
                     predictions, certainties, synchronisation = model(inputs)
                     loss, where_most_certain = image_classification_loss(predictions, certainties, targets, use_most_certain=True)
-                    # LSTM where_most_certain will just be -1 because use_most_certain is False owing to stability issues with LSTM training
                     accuracy = (predictions.argmax(1)[torch.arange(predictions.size(0), device=predictions.device),where_most_certain] == targets).float().mean().item()
-                    pbar_desc = f'LSTM Loss={loss.item():0.3f}. Acc={accuracy:0.3f}. LR={current_lr:0.6f}. Where_certain={where_most_certain.float().mean().item():0.2f}+-{where_most_certain.float().std().item():0.2f} ({where_most_certain.min().item():d}<->{where_most_certain.max().item():d})'
+                    pbar_desc = f'CTM Loss={loss.item():0.3f}. Acc={accuracy:0.3f}. LR={current_lr:0.6f}. Where_certain={where_most_certain.float().mean().item():0.2f}+-{where_most_certain.float().std().item():0.2f} ({where_most_certain.min().item():d}<->{where_most_certain.max().item():d})'
 
-                elif args.model == 'ff':
-                    predictions = model(inputs)
-                    loss = nn.CrossEntropyLoss()(predictions, targets)
-                    accuracy = (predictions.argmax(1) == targets).float().mean().item()
-                    pbar_desc = f'FF Loss={loss.item():0.3f}. Acc={accuracy:0.3f}. LR={current_lr:0.6f}'
+            elif args.model == 'lstm':
+                predictions, certainties, synchronisation = model(inputs)
+                loss, where_most_certain = image_classification_loss(predictions, certainties, targets, use_most_certain=True)
+                # LSTM where_most_certain will just be -1 because use_most_certain is False owing to stability issues with LSTM training
+                accuracy = (predictions.argmax(1)[torch.arange(predictions.size(0), device=predictions.device),where_most_certain] == targets).float().mean().item()
+                pbar_desc = f'LSTM Loss={loss.item():0.3f}. Acc={accuracy:0.3f}. LR={current_lr:0.6f}. Where_certain={where_most_certain.float().mean().item():0.2f}+-{where_most_certain.float().std().item():0.2f} ({where_most_certain.min().item():d}<->{where_most_certain.max().item():d})'
 
-            scaler.scale(loss).backward()
+            elif args.model == 'ff':
+                predictions = model(inputs)
+                loss = nn.CrossEntropyLoss()(predictions, targets)
+                accuracy = (predictions.argmax(1) == targets).float().mean().item()
+                pbar_desc = f'FF Loss={loss.item():0.3f}. Acc={accuracy:0.3f}. LR={current_lr:0.6f}'
 
-            if args.gradient_clipping!=-1:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.gradient_clipping)
-
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
+            # Backward pass with Accelerate
+            accelerator.backward(loss)
+            
+            if args.gradient_clipping > 0:
+                accelerator.clip_grad_norm_(model.parameters(), args.gradient_clipping)
+            
+            optimizer.step()
+            optimizer.zero_grad()
             scheduler.step()
 
             pbar.set_description(f'Dataset={args.dataset}. Model={args.model}. {pbar_desc}')
@@ -493,16 +516,16 @@ if __name__=='__main__':
 
                 pbar.set_description('Tracking: Computing TRAIN metrics')
                 with torch.no_grad(): # Should use inference_mode? CTM/LSTM scripts used no_grad
-                    loader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size_test, shuffle=True, num_workers=num_workers_test)
+                    # loader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size_test, shuffle=True, num_workers=num_workers_test) # Use prepared loader
                     all_targets_list = []
                     all_predictions_list = [] # List to store raw predictions (B, C, T) or (B, C)
                     all_predictions_most_certain_list = [] # Only for CTM/LSTM
                     all_losses = []
 
-                    with tqdm(total=len(loader), initial=0, leave=False, position=1, dynamic_ncols=True) as pbar_inner:
-                        for inferi, (inputs, targets) in enumerate(loader):
-                            inputs = inputs.to(device)
-                            targets = targets.to(device)
+                    with tqdm(total=len(trainloader), initial=0, leave=False, position=1, dynamic_ncols=True) as pbar_inner:
+                        for inferi, (inputs, targets) in enumerate(trainloader):
+                            # inputs = inputs.to(device) # Handled by accelerator.prepare
+                            # targets = targets.to(device) # Handled by accelerator.prepare
                             all_targets_list.append(targets.detach().cpu().numpy())
 
                             # Model-specific forward and loss for evaluation
@@ -552,16 +575,16 @@ if __name__=='__main__':
                 model.eval()
                 pbar.set_description('Tracking: Computing TEST metrics')
                 with torch.inference_mode(): # Use inference_mode for test eval
-                    loader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size_test, shuffle=True, num_workers=num_workers_test)
+                    # loader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size_test, shuffle=True, num_workers=num_workers_test) # Use prepared loader
                     all_targets_list = []
                     all_predictions_list = []
                     all_predictions_most_certain_list = [] # Only for CTM/LSTM
                     all_losses = []
 
-                    with tqdm(total=len(loader), initial=0, leave=False, position=1, dynamic_ncols=True) as pbar_inner:
-                       for inferi, (inputs, targets) in enumerate(loader):
-                            inputs = inputs.to(device)
-                            targets = targets.to(device)
+                    with tqdm(total=len(testloader), initial=0, leave=False, position=1, dynamic_ncols=True) as pbar_inner:
+                       for inferi, (inputs, targets) in enumerate(testloader):
+                            # inputs = inputs.to(device) # Handled by accelerator.prepare
+                            # targets = targets.to(device) # Handled by accelerator.prepare
                             all_targets_list.append(targets.detach().cpu().numpy())
 
                             # Model-specific forward and loss for evaluation
@@ -655,13 +678,13 @@ if __name__=='__main__':
                 if args.model in ['ctm', 'lstm']:
                     try: # For safety
                         inputs_viz, targets_viz = next(iter(testloader)) # Get a fresh batch
-                        inputs_viz = inputs_viz.to(device)
-                        targets_viz = targets_viz.to(device)
+                        # inputs_viz = inputs_viz.to(device) # Handled by accelerator.prepare
+                        # targets_viz = targets_viz.to(device) # Handled by accelerator.prepare
 
                         pbar.set_description('Tracking: Processing test data for viz')
                         predictions_viz, certainties_viz, _, pre_activations_viz, post_activations_viz, attention_tracking_viz = model(inputs_viz, track=True)
 
-                        att_shape = (model.kv_features.shape[2], model.kv_features.shape[3])
+                        att_shape = (accelerator.unwrap_model(model).kv_features.shape[2], accelerator.unwrap_model(model).kv_features.shape[3])
                         attention_tracking_viz = attention_tracking_viz.reshape(
                             attention_tracking_viz.shape[0], 
                             attention_tracking_viz.shape[1], -1, att_shape[0], att_shape[1])
@@ -695,31 +718,44 @@ if __name__=='__main__':
 
 
             # Save model checkpoint (conditional metrics)
+            # Save model checkpoint (conditional metrics)
             if (bi % args.save_every == 0 or bi == args.training_iterations - 1) and bi != start_iter:
-                pbar.set_description('Saving model checkpoint...')
-                checkpoint_data = {
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    'scaler_state_dict': scaler.state_dict(),
-                    'iteration': bi,
-                    # Always save these
-                    'train_losses': train_losses,
-                    'test_losses': test_losses,
-                    'train_accuracies': train_accuracies, # This is list of scalars for FF, list of arrays for CTM/LSTM
-                    'test_accuracies': test_accuracies, # This is list of scalars for FF, list of arrays for CTM/LSTM
-                    'iters': iters,
-                    'args': args, # Save args used for this run
-                    # RNG states
-                    'torch_rng_state': torch.get_rng_state(),
-                    'numpy_rng_state': np.random.get_state(),
-                    'random_rng_state': random.getstate(),
-                }
-                # Conditionally add metrics specific to CTM/LSTM
-                if args.model in ['ctm', 'lstm']:
-                    checkpoint_data['train_accuracies_most_certain'] = train_accuracies_most_certain
-                    checkpoint_data['test_accuracies_most_certain'] = test_accuracies_most_certain
+                if accelerator.is_main_process:
+                    pbar.set_description('Saving model checkpoint...')
+                    checkpoint_data = {
+                        'model_state_dict': accelerator.unwrap_model(model).state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
+                        'iteration': bi,
+                        'train_losses': train_losses,
+                        'test_losses': test_losses,
+                        'train_accuracies': train_accuracies,
+                        'test_accuracies': test_accuracies,
+                        'iters': iters,
+                        'args': args,
+                        'torch_rng_state': torch.get_rng_state(),
+                        'numpy_rng_state': np.random.get_state(),
+                        'random_rng_state': random.getstate(),
+                    }
+                    
+                    if args.model in ['ctm', 'lstm']:
+                        checkpoint_data['train_accuracies_most_certain'] = train_accuracies_most_certain
+                        checkpoint_data['test_accuracies_most_certain'] = test_accuracies_most_certain
 
-                torch.save(checkpoint_data, f'{args.log_dir}/checkpoint.pt')
+                    accelerator.save(checkpoint_data, f'{args.log_dir}/checkpoint.pt')
+                    
+                    # Push to Hub
+                    if args.push_to_hub and args.hub_model_id:
+                        if bi % (args.save_every * 5) == 0: # Upload less frequently
+                            try:
+                                upload_folder(
+                                    folder_path=args.log_dir,
+                                    repo_id=args.hub_model_id,
+                                    token=args.hub_token,
+                                    commit_message=f"Training checkpoint {bi}",
+                                    ignore_patterns=["*.pt"], 
+                                )
+                            except Exception as e:
+                                print(f"Failed to upload to hub: {e}")
 
             pbar.update(1)

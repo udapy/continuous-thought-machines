@@ -23,6 +23,7 @@ datasets = "*"
 huggingface_hub = "*"
 safetensors = "*"
 ffmpeg = "*"
+accelerate = ">=1.12.0,<2"
 
 [pypi-dependencies]
 autoclip = "*"

@@ -27,3 +27,5 @@ utils/hugging_face/
 .pixi/*
 !.pixi/config.toml
 changes.md
+assets/activations.gif
+examples/goldfish.jpg
